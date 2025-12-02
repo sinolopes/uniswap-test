@@ -1,138 +1,70 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.19;
 
-import {Test, console2} from "forge-std/Test.sol";
-
-import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
-import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
-import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
-import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
-import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
-import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
-
-import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
-import {Deployers} from "./utils/Deployers.sol";
-
+import "forge-std/Test.sol";
+import {GasSnapshot} from "forge-gas-snapshot/GasSnapshot.sol";
+import {IHooks} from "@uniswap/v4-core/contracts/interfaces/IHooks.sol";
+import {Hooks} from "@uniswap/v4-core/contracts/libraries/Hooks.sol";
+import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
+import {IPoolManager} from "@uniswap/v4-core/contracts/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/contracts/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/contracts/types/PoolId.sol";
+import {Deployers} from "@uniswap/v4-core/test/foundry-tests/utils/Deployers.sol";
+import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
+import {HookTest} from "./utils/HookTest.sol";
 import {Counter} from "../src/Counter.sol";
+import {HookMiner} from "./utils/HookMiner.sol";
 
-contract CounterTest is Test, Deployers {
-    using EasyPosm for IPositionManager;
+contract CounterTest is HookTest, Deployers, GasSnapshot {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
-    using StateLibrary for IPoolManager;
 
-    Currency currency0;
-    Currency currency1;
-
+    Counter counter;
     PoolKey poolKey;
-
-    Counter hook;
     PoolId poolId;
 
-    uint256 tokenId;
-    int24 tickLower;
-    int24 tickUpper;
-
     function setUp() public {
-        // Deploys all required artifacts.
-        deployArtifacts();
-
-        (currency0, currency1) = deployCurrencyPair();
+        // creates the pool manager, test tokens, and other utility routers
+        HookTest.initHookTestEnv();
 
         // Deploy the hook to an address with the correct flags
-        address flags = address(
-            uint160(
-                Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                    | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
-            ) ^ (0x4444 << 144) // Namespace the hook to avoid collisions
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_MODIFY_POSITION_FLAG
+                | Hooks.AFTER_MODIFY_POSITION_FLAG
         );
-        bytes memory constructorArgs = abi.encode(poolManager); // Add all the necessary constructor arguments from the hook
-        deployCodeTo("Counter.sol:Counter", constructorArgs, flags);
-        hook = Counter(flags);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, 0, type(Counter).creationCode, abi.encode(address(manager)));
+        counter = new Counter{salt: salt}(IPoolManager(address(manager)));
+        require(address(counter) == hookAddress, "CounterTest: hook address mismatch");
 
         // Create the pool
-        poolKey = PoolKey(currency0, currency1, 3000, 60, IHooks(hook));
+        poolKey = PoolKey(Currency.wrap(address(token0)), Currency.wrap(address(token1)), 3000, 60, IHooks(counter));
         poolId = poolKey.toId();
-        poolManager.initialize(poolKey, Constants.SQRT_PRICE_1_1);
+        manager.initialize(poolKey, SQRT_RATIO_1_1, ZERO_BYTES);
 
-        // Provide full-range liquidity to the pool
-        tickLower = TickMath.minUsableTick(poolKey.tickSpacing);
-        tickUpper = TickMath.maxUsableTick(poolKey.tickSpacing);
-
-        uint128 liquidityAmount = 100e18;
-
-        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
-            Constants.SQRT_PRICE_1_1,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            liquidityAmount
-        );
-
-        (tokenId,) = positionManager.mint(
-            poolKey,
-            tickLower,
-            tickUpper,
-            liquidityAmount,
-            amount0Expected + 1,
-            amount1Expected + 1,
-            address(this),
-            block.timestamp,
-            Constants.ZERO_BYTES
+        // Provide liquidity to the pool
+        modifyPositionRouter.modifyPosition(poolKey, IPoolManager.ModifyPositionParams(-60, 60, 10 ether));
+        modifyPositionRouter.modifyPosition(poolKey, IPoolManager.ModifyPositionParams(-120, 120, 10 ether));
+        modifyPositionRouter.modifyPosition(
+            poolKey, IPoolManager.ModifyPositionParams(TickMath.minUsableTick(60), TickMath.maxUsableTick(60), 10 ether)
         );
     }
 
     function testCounterHooks() public {
         // positions were created in setup()
-        assertEq(hook.beforeAddLiquidityCount(poolId), 1);
-        assertEq(hook.beforeRemoveLiquidityCount(poolId), 0);
+        assertEq(counter.beforeModifyPositionCount(poolId), 3);
+        assertEq(counter.afterModifyPositionCount(poolId), 3);
 
-        assertEq(hook.beforeSwapCount(poolId), 0);
-        assertEq(hook.afterSwapCount(poolId), 0);
+        assertEq(counter.beforeSwapCount(poolId), 0);
+        assertEq(counter.afterSwapCount(poolId), 0);
 
         // Perform a test swap //
-        uint256 amountIn = 1e18;
-        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
-            amountIn: amountIn,
-            amountOutMin: 0, // Very bad, but we want to allow for unlimited price impact
-            zeroForOne: true,
-            poolKey: poolKey,
-            hookData: Constants.ZERO_BYTES,
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
+        int256 amount = 100;
+        bool zeroForOne = true;
+        swap(poolKey, amount, zeroForOne);
         // ------------------- //
 
-        assertEq(int256(swapDelta.amount0()), -int256(amountIn));
-
-        assertEq(hook.beforeSwapCount(poolId), 1);
-        assertEq(hook.afterSwapCount(poolId), 1);
-    }
-
-    function testLiquidityHooks() public {
-        // positions were created in setup()
-        assertEq(hook.beforeAddLiquidityCount(poolId), 1);
-        assertEq(hook.beforeRemoveLiquidityCount(poolId), 0);
-
-        // remove liquidity
-        uint256 liquidityToRemove = 1e18;
-        positionManager.decreaseLiquidity(
-            tokenId,
-            liquidityToRemove,
-            0, // Max slippage, token0
-            0, // Max slippage, token1
-            address(this),
-            block.timestamp,
-            Constants.ZERO_BYTES
-        );
-
-        assertEq(hook.beforeAddLiquidityCount(poolId), 1);
-        assertEq(hook.beforeRemoveLiquidityCount(poolId), 1);
+        assertEq(counter.beforeSwapCount(poolId), 1);
+        assertEq(counter.afterSwapCount(poolId), 1);
     }
 }
